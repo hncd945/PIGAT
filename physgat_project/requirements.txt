@@ -1,0 +1,18 @@
+torch
+torch-geometric
+pandas
+numpy
+scipy
+scikit-learn
+matplotlib
+seaborn
+tqdm
+omegaconf
+hydra-core
+tensorboard
+networkx
+openpyxl # For writing Excel files in analysis
+rasterio
+pysheds
+pyproj
+plotly # For interactive visualizations (optional)

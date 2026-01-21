@@ -1,0 +1,341 @@
+# Hydra: redirect output to run_outputs/
+hydra:
+  run:
+    dir: run_outputs/${now:%Y-%m-%d_%H-%M-%S}
+
+# ===================================================================
+# PhysGAT Default Configuration File
+# ===================================================================
+
+# --- General Settings ---
+seed: 42
+device: "cuda" # Options: "cuda" or "cpu"
+
+# --- Data Settings ---
+data_dir: "data"
+dem_path: "dem/DEM.tif"  # DEM path relative to project root
+output_dir: "${hydra:runtime.output_dir}"
+log_dir: "${hydra:runtime.output_dir}/logs"
+metals:
+  - "Cr"
+  - "Ni"
+  - "Cu"
+  - "Zn"
+  - "As"
+  - "Cd"
+  - "Pb"
+
+# --- Environment Settings ---
+environment:
+  prevailing_wind_direction: 225   # Prevailing wind direction (degrees, 0-360)
+
+# --- Model Hyperparameters ---
+model:
+  hidden_channels: 128  # Kept at 128 to balance performance and training efficiency
+  out_channels: 64
+  num_heads: 4
+  dropout_rate: 0.2
+  decoder_activation: "sigmoid"
+  # Multi-scale mechanism settings
+  multi_scale:
+    enabled: true
+    hops: [1, 2] # Number of hops for parallel GATv2Conv layers
+
+
+
+# --- Training Settings ---
+training:
+  learning_rate: 0.005  # Updated from 0.001 based on sensitivity analysis (optimal value)
+  weight_decay: 1.0e-5
+  epochs: 1  # Full training with 300 epochs
+  batch_size: 1 # 全量批次训练
+  early_stopping_patience: 1000  # 为满足“完整300轮”运行要求，扩大早停耐心
+
+  # Step-wise learning rate scheduling configuration
+  step_size: 50  # Minimum epochs between LR adjustments (step-wise pattern)
+  step_gamma: 0.8  # Step-wise decay factor (more conservative than 0.5)
+  plateau_min_lr: 5e-7  # Lower minimum learning rate
+
+  # Adaptive learning rate configuration
+  adaptive_lr: true
+  adaptive_lr_window: 15  # Longer observation window (was 8)
+  adaptive_lr_cooldown: 80  # Extended cooldown (was 50)
+  adaptive_lr_down_factor: 0.96  # Less aggressive reduction (was 0.93)
+  adaptive_lr_min_improve: 0.01  # Lower improvement threshold (was 0.02)
+  # PyTorch 2.0 Compile 加速
+  compile: false
+  # 自动混合精度 (AMP)
+  amp: true
+  # 学习率调度器设置
+  scheduler_type: "step"  # 实际训练采用阶梯式学习率调度（StepLR）
+  lr_decay_rate: 0.95  # 指数衰减率（仅当scheduler_type为"exponential"时使用）
+  lr_step_size: 50     # 阶梯衰减步长（仅当scheduler_type为"step"时使用）
+  lr_gamma: 0.8        # 阶梯衰减因子（与Trainer默认的 step_gamma 一致）
+
+  # === Sparsity Regularization Settings ===
+  # Strategy 1: Entropy Regularization - penalize high entropy (uniform) distributions
+  use_entropy_regularization: true  # Enable entropy regularization
+  entropy_weight: 0.3  # Weight for entropy regularization (H(p) = -Σ(p*log(p)))
+
+  # Strategy 2: Gini Coefficient Penalty - penalize low Gini (too uniform)
+  use_gini_penalty: true  # Enable Gini coefficient penalty
+  gini_weight: 0.5  # Weight for Gini penalty
+  gini_threshold: 0.5  # Only penalize if Gini < 0.5 (too uniform)
+
+# --- Convergence Study Mode (Optional) ---
+# This section controls whether to override training.epochs and ensemble.n_ensemble
+# for convergence study experiments. Set enabled=true to activate.
+convergence_study:
+  enabled: false  # DISABLED - using direct training settings for quick test
+  epochs: 300    # Quick test with 300 epochs to verify anti-averaging effect
+  n_ensemble: 1  # Single model for quick testing
+  description: "Quick test mode to verify entropy regularization effectiveness"
+
+# --- Loss Function Configuration ---
+# Scaling factors and adaptive weight constraints for loss components
+loss_weights:
+  # Scaling factors applied AFTER normalization to balance initial loss magnitudes
+  scale_factors:
+    chemistry: 3.3      # chemistry_loss * 1.1 * 3 (enhanced by 3x to prevent contribution averaging)
+    distance: 1.7       # distance_loss * 1.7 (scale to target initial value ~1.7)
+    strength: 11.4      # strength_loss * 3.8 * 3 (enhanced by 3x to prevent contribution averaging)
+    reconstruction: 4.4 # reconstruction_loss * 4.4 (scale to target initial value ~1.7)
+
+  # Adaptive weight constraints (for learnable task-importance weighting)
+  adaptive_weights:
+    enabled: true
+    # Individual weight bounds [min, max] to prevent single loss dominance
+    chemistry:
+      min: 0.20
+      max: 0.35
+    distance:
+      min: 0.15
+      max: 0.30
+    strength:
+      min: 0.15
+      max: 0.30
+    reconstruction:
+      min: 0.20
+      max: 0.35
+    # Constraint: chemistry + reconstruction >= chemical_total_min
+    # This ensures chemical fingerprint reconstruction priority
+    chemical_total_min: 0.5
+
+# --- Graph Construction Parameters ---
+graph:
+  k_neighbors_r: 8 # Number of receptor-receptor connections
+  k_neighbors_s: 4 # Maximum connections per source type (not used in new filtering)
+
+  # === Stage 1: Distance-based Pre-filtering ===
+  max_distance_km:
+    irrigation: 3.0    # Irrigation sources: 3km radius (updated from 1km)
+    fertilizer: 2.0    # Fertilizer sources: 2km radius (updated from 1km)
+    manure: 0.2       # Manure sources: 0.2km radius (very strict, no exception allowed)
+    atmosphere: 5.0    # Atmosphere sources: 5km radius (using DEM climbing distance)
+    default: 5.0       # Default distance limit
+
+  # Distance-to-weight mapping and physical modifiers
+  distance_decay_km: 5.0
+  terrain:
+    elevation_diff_scale_km: 1000.0  # Larger -> weaker terrain penalty
+    # Enable DEM-based distance for fertilizer and manure sources
+    enable_fertilizer_dem: true       # Enable terrain consideration for fertilizer sources
+    enable_manure_dem: true          # Enable terrain consideration for manure sources
+    fertilizer_slope_penalty: 1.2     # Multiplier for slope-based distance penalty
+    manure_slope_penalty: 1.3        # Multiplier for slope-based distance penalty
+  irrigation:
+    direct_distance_threshold_km: 3.0  # Above this, use curved distance factor
+    curve_multiplier: 1.5              # Multiplier for curved path approximation
+
+  # === Stage 2: Scoring and Top-K Selection ===
+  candidate_selection:
+    # Enable strict candidate filtering
+    use_strict_filtering: true
+    # Source-type specific scoring weights for candidate ranking
+    scoring_weights:
+      # Atmosphere sources: prioritize distance (70%), chemical similarity (20%), strength (10%)
+      atmosphere:
+        distance_score: 0.6      # Distance score weight: 60%
+        wind_score: 0.2          # Wind direction score weight: 20%
+        chemical_score: 0.15     # Chemical similarity score weight: 15%
+        strength_score: 0.05     # Source strength score weight: 5%
+      # Irrigation sources: prioritize distance (70%), chemical similarity (20%), strength (10%)
+      irrigation:
+        distance_score: 0.7      # Distance score weight: 70%
+        hydro_score: 0.2         # Hydrological feature score: 20% (slope angle consideration)
+        chemical_score: 0.05     # Chemical similarity score weight: 5%
+        strength_score: 0.05     # Source strength score weight: 5%
+      # Fertilizer sources: prioritize distance (70%), chemical similarity (20%), strength (10%)
+      fertilizer:
+        distance_score: 0.7      # Distance score weight: 70%
+        chemical_score: 0.2      # Chemical similarity score weight: 20%
+        strength_score: 0.1      # Source strength score weight: 10%
+        wind_score: 0.0          # Wind direction not applicable: 0%
+      # Manure waste sources: prioritize distance (70%), chemical similarity (20%), strength (10%)
+      manure:
+        distance_score: 0.7      # Distance score weight: 70%
+        chemical_score: 0.2      # Chemical similarity score weight: 20%
+        strength_score: 0.1      # Source strength score weight: 10%
+        wind_score: 0.0          # Wind direction not applicable: 0%
+      # Default weights for unknown source types
+      default:
+        distance_score: 0.5      # Distance score weight: 50%
+        chemical_score: 0.2      # Chemical similarity score weight: 20%
+        strength_score: 0.15     # Source strength score weight: 15%
+        wind_score: 0.15         # Wind direction score weight: 15%
+    # Exception handling for zero-candidate scenarios
+    zero_candidate_exception:
+      enabled: false             # Disable exception mechanism (删除类0额外添加机制)
+      distance_weight_reduction: 0.3  # Reduce distance weight to 30% for exception sources
+      # Adjusted weights for exception sources (distance reduced, others increased)
+      atmosphere_exception:
+        distance_score: 0.3      # Reduced distance weight
+        wind_score: 0.3          # Increased wind weight
+        chemical_score: 0.2      # Increased chemical weight
+        strength_score: 0.2      # Increased strength weight
+      irrigation_exception:
+        distance_score: 0.3      # Reduced distance weight
+        hydro_score: 0.3         # Increased hydro weight
+        chemical_score: 0.25     # Increased chemical weight
+        strength_score: 0.15     # Increased strength weight
+      fertilizer_exception:
+        distance_score: 0.3      # Reduced distance weight
+        chemical_score: 0.4      # Increased chemical weight
+        strength_score: 0.3      # Increased strength weight
+        wind_score: 0.0          # Wind not applicable
+      manure_exception:
+        distance_score: 0.3      # Reduced distance weight
+        chemical_score: 0.4      # Increased chemical weight
+        strength_score: 0.3      # Increased strength weight
+        wind_score: 0.0          # Wind not applicable
+    # === Optimized candidate selection settings ===
+    # Minimum number of candidates per source type
+    min_candidates_per_type: 1   # At least 1 candidate per type (if available)
+    # Top-K selection per source type per receptor
+    max_candidates_per_type: 3   # Up to 3 candidates per type
+    # Global minimum candidates per receptor
+    global_min_candidates: 4     # At least 4 candidates per receptor (1 per type)
+    # Global maximum candidates per receptor
+    global_max_candidates: 12    # At most 12 candidates per receptor
+    # Maximum total connections per receptor
+    max_total_connections_per_receptor: 12  # Limit to 12 candidates max
+    # Minimum total connections per receptor
+    min_total_connections_per_receptor: 4   # Ensure minimum exploration (fixed: was 16, now 4)
+    # Allow zero-candidate exception (legacy; see zero_candidate_exception.enabled)
+    allow_zero_candidate_exception: true
+
+  # === 保留的配置（降低重要性） ===
+  chem_sim_absolute_threshold: 0.4  # Updated from 0.3 based on sensitivity analysis (optimal value)
+  # 模糊度权重计算阈值
+  ambiguity_receptor_threshold: 0.6  # 受体相似度阈值
+  ambiguity_inter_threshold: 0.6     # 源间相似度阈值
+  # 数值计算参数
+  min_wind_weight: 0.1               # 风向不利源的最小权重
+  numerical_epsilon: 1.0e-8          # 数值稳定性参数
+
+# --- 重点污染物匹配损失配置 ---
+priority_pollutant_match:
+  enabled: true  # 启用重点污染物匹配损失
+  weight: 0.1  # 损失权重
+  target_source_types: ["fertilizer", "manure"]  # 目标源类型
+  top_pollutants: 1  # 考虑受体中污染最严重的1个重金属（基于内梅罗指数权重）
+  match_threshold: 0.7  # 源在重点污染物上的浓度匹配阈值（相对于最大值）
+
+# --- 污染分析配置 ---
+pollution_analysis:
+  # 内梅罗指数金属权重配置
+  metal_weights:
+    Hg: 3  # 汞 - 高毒性重金属
+    Pb: 3  # 铅 - 高毒性重金属
+    Cd: 3  # 镉 - 高毒性重金属
+    As: 3  # 砷 - 高毒性重金属
+    Zn: 2  # 锌 - 中等毒性
+    Cu: 2  # 铜 - 中等毒性
+    Cr: 2  # 铬 - 中等毒性
+    Ni: 2  # 镍 - 中等毒性
+
+  # 污染等级分类标准
+  pollution_levels:
+    clean: 0.7           # 清洁：≤ 0.7
+    still_clean: 1.0     # 尚清洁：0.7 < x ≤ 1.0
+    lightly_polluted: 2.0  # 轻度污染：1.0 < x ≤ 2.0
+    moderately_polluted: 3.0  # 中度污染：2.0 < x ≤ 3.0
+    # 重度污染：> 3.0
+
+  # 主要/次要污染物分析权重（基于环境标准和毒性）
+  primary_secondary_weights:
+    Cr: 3   # 高毒性重金属
+    Ni: 2   # 中等毒性
+    Cu: 2   # 中等毒性
+    Zn: 1   # 低毒性（必需元素）
+    As: 3   # 高毒性重金属
+    Cd: 3   # 高毒性重金属
+    Pb: 3   # 高毒性重金属
+
+
+# --- PMF 设置 ---
+pmf:
+  n_components: 4 # PMF因子数，可被自动检测覆盖
+  max_iter: 1000  # 增加迭代次数确保PMF充分收敛
+  tol: 1.0e-6
+  alpha_W: 0.01
+  alpha_H: 0.01
+
+# --- 集成学习设置 ---
+ensemble:
+  n_ensemble: 5  # Number of independent models in the ensemble
+
+  # === 1. 一致性训练策略 ===
+  use_consensus_loss: false
+  use_representation_loss: false
+  lambda_representation: 0.0
+  lambda_consistency: 0.0
+  consensus_loss_type: "mse"
+  consensus_warmup_epochs: 0
+  lambda_schedule: "constant"
+
+  # === 2. 聚合与评估 ===
+  aggregation_method: "trimmed_mean"
+  trim_percentage: 0.2
+  use_ema_teacher: true
+  ema_decay: 0.999
+
+  # === 3. 集成一致性增强配置 ===
+  adaptive_loss_weights:
+    enabled: false
+  fixed_loss_weights:
+    enabled: false
+  loss_weight_guarantee:
+    enabled: false
+  std_constraint: true  # Enable variance constraint
+  model_diversity_control: true  # Enable diversity control
+
+  # Enhanced ensemble consistency parameters
+  diversity_regularization: 0.03  # Reduced from default 0.05
+  target_std_ratio: 0.12  # Reduced from default 0.15
+  std_penalty_weight: 0.15  # Increased penalty for high variance
+
+  # Weight allocation consistency parameters
+  weight_allocation_consistency: true
+  consistency_regularization_weight: 0.08
+  max_weight_deviation: 0.25  # Maximum allowed deviation from ensemble mean
+  consistency_warmup_epochs: 50  # Epochs before applying consistency constraints
+
+# --- 不确定性分析 ---
+uncertainty:
+  num_passes: 100  # 增加不确定性分析的采样次数，提高估计精度
+
+# --- 可视化 ---
+visualization:
+  top_k_receptors: 20
+  ego_graph_top_k_contrib: 15
+
+
+
+# --- 调试与开关 ---
+debug:
+  loss_checks:
+    enabled: false   # 开启后将在训练中进行数据流/归一化/NaN检查并输出日志
+  csv_exports:
+    enabled: false   # 开启后导出 per_metal_residuals.csv 等调试文件
+
